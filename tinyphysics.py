@@ -134,6 +134,9 @@ class TinyPhysicsSimulator:
     seed = int(md5(self.data_path.encode()).hexdigest(), 16) % 10**4
     np.random.seed(seed)
 
+    if hasattr(self.controller, 'reset'):
+      self.controller.reset()
+
   def get_data(self, data_path: str) -> pd.DataFrame:
     df = pd.read_csv(data_path)
     processed_df = pd.DataFrame({
@@ -186,6 +189,16 @@ class TinyPhysicsSimulator:
     self.futureplan = futureplan
     self.control_step(self.step_idx)
     self.sim_step(self.step_idx)
+
+    if hasattr(self.controller, 'record'):
+      self.controller.record(
+        step_idx=self.step_idx,
+        state=state,
+        future_plan=futureplan,
+        target_lataccel=target,
+        action=self.action_history[-1],
+        current_lataccel=self.current_lataccel,
+      )
     self.step_idx += 1
 
   def plot_data(self, ax, lines, axis_labels, title) -> None:

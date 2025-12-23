@@ -50,6 +50,12 @@ class Controller(BaseController):
     # np.random.seed(seed)
 
 
+  def record(self, step_idx, state, future_plan, target_lataccel, action, current_lataccel):
+    self.state_history.append(state)
+    self.action_history.append(action)
+    self.current_lataccel_history.append(current_lataccel)
+
+
   def calc_pid(self, target_lataccel, current_lataccel, state, future_plan):
 
     # print(f"Target: {target_lataccel}\nCurrent: {current_lataccel}") #\nState:{state}\nFuture:{future_plan}")
@@ -60,20 +66,21 @@ class Controller(BaseController):
     return self.p * error + self.i * self.error_integral + self.d * error_diff
   
 
-  def calc_cost(self, target_lataccel, current_lataccel):
-    lat_accel_cost = ((target_lataccel - current_lataccel)**2) * 100
-    # TODO: calculate jerk cost
-    print(f"current: {current_lataccel}, prev: {self.current_lataccel_history[-1]}")
-    jerk_cost = (((current_lataccel - self.current_lataccel_history[-1]) / DEL_T)**2) * 100
+  def calc_cost(self, target_lataccel, next_lataccel, prev_lataccel):
+    lat_accel_cost = ((target_lataccel - next_lataccel)**2) * 100
+    if prev_lataccel is None:
+      jerk_cost = 0.0
+    else:
+      jerk_cost = (((next_lataccel - prev_lataccel) / DEL_T)**2) * 100
 
-    return lat_accel_cost + jerk_cost
+    return (lat_accel_cost * LAT_ACCEL_COST_MULTIPLIER) + jerk_cost
 
   def predict_and_calc_cost(self, target_lataccel, current_lataccel, state, action,):
 
     # temporary histories
     state_history=copy.deepcopy(self.state_history) + [state]
     action_history=copy.deepcopy(self.action_history) + [action]
-    current_lataccel_history=copy.deepcopy(self.current_lataccel_history)+ [current_lataccel]
+    current_lataccel_history=copy.deepcopy(self.current_lataccel_history)
 
     # copied from sim_step
     pred = self.tpm.get_current_lataccel_deterministic(
@@ -83,10 +90,11 @@ class Controller(BaseController):
     )
 
     pred = np.clip(pred, current_lataccel - MAX_ACC_DELTA, current_lataccel + MAX_ACC_DELTA)
+    prev_lataccel = current_lataccel
     current_lataccel = pred
     
     # TODO: something weird with lat_accel
-    return current_lataccel, self.calc_cost(target_lataccel, current_lataccel)
+    return current_lataccel, self.calc_cost(target_lataccel, current_lataccel, prev_lataccel)
 
   
   def calc_mpc(self, target_lataccel, current_lataccel, state, future_plan, pid_result):
@@ -137,11 +145,6 @@ class Controller(BaseController):
         future_plan=future_plan,
         pid_result=action,
       )
-
-    # Update histories
-    self.state_history.append(state)
-    self.current_lataccel_history.append(current_lataccel)
-    self.action_history.append(action)
 
     return action
 
