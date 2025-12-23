@@ -7,7 +7,7 @@ MODEL_PATH = "/Users/vaibhavviswanathan/projects/controls_challenge/models/tinyp
 MPC_HORIZON = 5
 MPC_NUM_CANDIDATES = 101
 MPC_ACTION_RANGE = 0.15   # Smaller range to stay closer to PID
-MPC_ACTION_DELTA_COST = 1.0
+MPC_ACTION_DELTA_COST = 2.0 #1.0
 MPC_DEBUG = True  # Set to True to print debug info
 
 # Use a separate RNG for MPC to avoid polluting the simulator's RNG

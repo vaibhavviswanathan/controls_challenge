@@ -4,3 +4,7 @@ pandas==2.1.2
 matplotlib==3.8.1
 seaborn==0.13.2
 tqdm
+gymnasium>=0.29.0
+stable-baselines3>=2.0.0
+torch>=2.0.0
+tensorboard
