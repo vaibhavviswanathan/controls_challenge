@@ -76,7 +76,7 @@ class Controller(BaseController):
     current_lataccel_history=copy.deepcopy(self.current_lataccel_history)+ [current_lataccel]
 
     # copied from sim_step
-    pred = self.tpm.get_current_lataccel(
+    pred = self.tpm.get_current_lataccel_deterministic(
       sim_states=state_history[-CONTEXT_LENGTH:],
       actions=action_history[-CONTEXT_LENGTH:],
       past_preds=current_lataccel_history[-CONTEXT_LENGTH:]

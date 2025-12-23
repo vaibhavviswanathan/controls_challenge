@@ -84,6 +84,14 @@ class TinyPhysicsModel:
     sample = np.random.choice(probs.shape[2], p=probs[0, -1])
     return sample
 
+  def predict_deterministic(self, input_data: dict, temperature=1.) -> int:
+    res = self.ort_session.run(None, input_data)[0]
+    probs = self.softmax(res / temperature, axis=-1)
+    # we only care about the last timestep (batch size is just 1)
+    assert probs.shape[0] == 1
+    assert probs.shape[2] == VOCAB_SIZE
+    return int(np.argmax(probs[0, -1]))
+
   def get_current_lataccel(self, sim_states: List[State], actions: List[float], past_preds: List[float]) -> float:
     tokenized_actions = self.tokenizer.encode(past_preds)
     raw_states = [list(x) for x in sim_states]
@@ -93,6 +101,16 @@ class TinyPhysicsModel:
       'tokens': np.expand_dims(tokenized_actions, axis=0).astype(np.int64)
     }
     return self.tokenizer.decode(self.predict(input_data, temperature=0.8))
+
+  def get_current_lataccel_deterministic(self, sim_states: List[State], actions: List[float], past_preds: List[float]) -> float:
+    tokenized_actions = self.tokenizer.encode(past_preds)
+    raw_states = [list(x) for x in sim_states]
+    states = np.column_stack([actions, raw_states])
+    input_data = {
+      'states': np.expand_dims(states, axis=0).astype(np.float32),
+      'tokens': np.expand_dims(tokenized_actions, axis=0).astype(np.int64)
+    }
+    return self.tokenizer.decode(self.predict_deterministic(input_data, temperature=0.8))
 
 
 class TinyPhysicsSimulator:
