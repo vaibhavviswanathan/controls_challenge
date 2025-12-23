@@ -34,6 +34,7 @@ STEER_RANGE = [-2, 2]
 MAX_ACC_DELTA = 0.5
 DEL_T = 0.1
 LAT_ACCEL_COST_MULTIPLIER = 50.0
+USE_DETERMINISTIC_SIM = False  # Set to False for stochastic dynamics
 
 FUTURE_PLAN_STEPS = FPS * 5  # 5 secs
 
@@ -92,6 +93,25 @@ class TinyPhysicsModel:
     assert probs.shape[2] == VOCAB_SIZE
     return int(np.argmax(probs[0, -1]))
 
+  def predict_deterministic_batch(self, input_data: dict, temperature=1.) -> np.ndarray:
+    res = self.ort_session.run(None, input_data)[0]
+    probs = self.softmax(res / temperature, axis=-1)
+    assert probs.shape[2] == VOCAB_SIZE
+    return np.argmax(probs[:, -1], axis=-1).astype(np.int64)
+
+  def predict_stochastic_batch(self, input_data: dict, temperature=1., rng=None) -> np.ndarray:
+    res = self.ort_session.run(None, input_data)[0]
+    probs = self.softmax(res / temperature, axis=-1)
+    assert probs.shape[2] == VOCAB_SIZE
+    batch_size = probs.shape[0]
+    samples = np.zeros(batch_size, dtype=np.int64)
+    for i in range(batch_size):
+      if rng is not None:
+        samples[i] = rng.choice(probs.shape[2], p=probs[i, -1])
+      else:
+        samples[i] = np.random.choice(probs.shape[2], p=probs[i, -1])
+    return samples
+
   def get_current_lataccel(self, sim_states: List[State], actions: List[float], past_preds: List[float]) -> float:
     tokenized_actions = self.tokenizer.encode(past_preds)
     raw_states = [list(x) for x in sim_states]
@@ -111,6 +131,24 @@ class TinyPhysicsModel:
       'tokens': np.expand_dims(tokenized_actions, axis=0).astype(np.int64)
     }
     return self.tokenizer.decode(self.predict_deterministic(input_data, temperature=0.8))
+
+  def get_current_lataccel_deterministic_batch(self, states: np.ndarray, past_preds: np.ndarray) -> np.ndarray:
+    tokenized_actions = self.tokenizer.encode(past_preds)
+    input_data = {
+      'states': states.astype(np.float32),
+      'tokens': tokenized_actions.astype(np.int64)
+    }
+    tokens = self.predict_deterministic_batch(input_data, temperature=0.8)
+    return self.tokenizer.decode(tokens)
+
+  def get_current_lataccel_stochastic_batch(self, states: np.ndarray, past_preds: np.ndarray, rng=None) -> np.ndarray:
+    tokenized_actions = self.tokenizer.encode(past_preds)
+    input_data = {
+      'states': states.astype(np.float32),
+      'tokens': tokenized_actions.astype(np.int64)
+    }
+    tokens = self.predict_stochastic_batch(input_data, temperature=0.8, rng=rng)
+    return self.tokenizer.decode(tokens)
 
 
 class TinyPhysicsSimulator:
@@ -149,11 +187,18 @@ class TinyPhysicsSimulator:
     return processed_df
 
   def sim_step(self, step_idx: int) -> None:
-    pred = self.sim_model.get_current_lataccel(
-      sim_states=self.state_history[-CONTEXT_LENGTH:],
-      actions=self.action_history[-CONTEXT_LENGTH:],
-      past_preds=self.current_lataccel_history[-CONTEXT_LENGTH:]
-    )
+    if USE_DETERMINISTIC_SIM:
+      pred = self.sim_model.get_current_lataccel_deterministic(
+        sim_states=self.state_history[-CONTEXT_LENGTH:],
+        actions=self.action_history[-CONTEXT_LENGTH:],
+        past_preds=self.current_lataccel_history[-CONTEXT_LENGTH:]
+      )
+    else:
+      pred = self.sim_model.get_current_lataccel(
+        sim_states=self.state_history[-CONTEXT_LENGTH:],
+        actions=self.action_history[-CONTEXT_LENGTH:],
+        past_preds=self.current_lataccel_history[-CONTEXT_LENGTH:]
+      )
     pred = np.clip(pred, self.current_lataccel - MAX_ACC_DELTA, self.current_lataccel + MAX_ACC_DELTA)
     if step_idx >= CONTROL_START_IDX:
       self.current_lataccel = pred

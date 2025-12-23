@@ -1,12 +1,17 @@
 from . import BaseController
 import numpy as np
-from tinyphysics import TinyPhysicsModel, LataccelTokenizer
-import copy
+from tinyphysics import TinyPhysicsModel
 
 MODEL_PATH = "/Users/vaibhavviswanathan/projects/controls_challenge/models/tinyphysics.onnx"
 
-MPC_RANGE = 0.1
-MPC_BINS = 11 #101
+MPC_HORIZON = 5
+MPC_NUM_CANDIDATES = 101
+MPC_ACTION_RANGE = 0.15   # Smaller range to stay closer to PID
+MPC_ACTION_DELTA_COST = 1.0
+MPC_DEBUG = True  # Set to True to print debug info
+
+# Use a separate RNG for MPC to avoid polluting the simulator's RNG
+MPC_RNG = np.random.default_rng(42)
 
 ACC_G = 9.81
 FPS = 10
@@ -40,10 +45,27 @@ class Controller(BaseController):
     self.current_lataccel_history = []
     self.reset()
 
+  def _estimate_step_idx(self) -> int:
+    return len(self.action_history) + CONTEXT_LENGTH
+
+  def _get_horizon(self, future_plan) -> int:
+    if future_plan is None:
+      return 1
+    min_len = min(
+      len(future_plan.lataccel),
+      len(future_plan.roll_lataccel),
+      len(future_plan.v_ego),
+      len(future_plan.a_ego),
+    )
+    return int(max(1, min(MPC_HORIZON, min_len + 1)))
+
   def reset(self):
     self.state_history = []
     self.action_history = []
     self.current_lataccel_history = []
+
+    self.error_integral = 0
+    self.prev_error = 0
 
     # idk why
     # seed = int(md5(self.data_path.encode()).hexdigest(), 16) % 10**4
@@ -66,65 +88,145 @@ class Controller(BaseController):
     return self.p * error + self.i * self.error_integral + self.d * error_diff
   
 
-  def calc_cost(self, target_lataccel, next_lataccel, prev_lataccel):
-    lat_accel_cost = ((target_lataccel - next_lataccel)**2) * 100
-    if prev_lataccel is None:
-      jerk_cost = 0.0
-    else:
-      jerk_cost = (((next_lataccel - prev_lataccel) / DEL_T)**2) * 100
-
-    return (lat_accel_cost * LAT_ACCEL_COST_MULTIPLIER) + jerk_cost
-
-  def predict_and_calc_cost(self, target_lataccel, current_lataccel, state, action,):
-
-    # temporary histories
-    state_history=copy.deepcopy(self.state_history) + [state]
-    action_history=copy.deepcopy(self.action_history) + [action]
-    current_lataccel_history=copy.deepcopy(self.current_lataccel_history)
-
-    # copied from sim_step
-    pred = self.tpm.get_current_lataccel_deterministic(
-      sim_states=state_history[-CONTEXT_LENGTH:],
-      actions=action_history[-CONTEXT_LENGTH:],
-      past_preds=current_lataccel_history[-CONTEXT_LENGTH:]
-    )
-
-    pred = np.clip(pred, current_lataccel - MAX_ACC_DELTA, current_lataccel + MAX_ACC_DELTA)
-    prev_lataccel = current_lataccel
-    current_lataccel = pred
+  def _predict_single_step(self, actions: np.ndarray, current_lataccel: float, state) -> np.ndarray:
+    """Predict lataccel for given actions (for debugging)."""
+    batch = len(actions)
     
-    # TODO: something weird with lat_accel
-    return current_lataccel, self.calc_cost(target_lataccel, current_lataccel, prev_lataccel)
+    past_actions = np.asarray(self.action_history[-(CONTEXT_LENGTH - 1):], dtype=np.float32)
+    past_states = np.asarray([list(s) for s in self.state_history[-(CONTEXT_LENGTH - 1):]], dtype=np.float32)
+    past_preds = np.asarray(self.current_lataccel_history[-CONTEXT_LENGTH:], dtype=np.float32)
 
-  
+    current_state = np.asarray(list(state), dtype=np.float32)
+    state_ctx_full = np.concatenate([past_states, current_state[None, :]], axis=0)
+
+    state_ctx = np.tile(state_ctx_full[None, :, :], (batch, 1, 1))
+    actions_ctx = np.tile(np.concatenate([past_actions, np.zeros((1,), dtype=np.float32)], axis=0)[None, :], (batch, 1))
+    preds_ctx = np.tile(past_preds[None, :], (batch, 1))
+
+    actions_ctx[:, -1] = actions
+    model_states = np.concatenate([actions_ctx[:, :, None], state_ctx], axis=2)
+    pred = self.tpm.get_current_lataccel_deterministic_batch(model_states, preds_ctx)
+    pred = np.clip(pred, current_lataccel - MAX_ACC_DELTA, current_lataccel + MAX_ACC_DELTA)
+    return pred
+
+  def _rollout_cost_1d(self, first_actions: np.ndarray, target_lataccel: float, current_lataccel: float, state, future_plan, horizon: int, debug: bool = False) -> np.ndarray:
+    """
+    1D Shooting MPC: evaluate candidate first actions.
+    For each candidate, assume constant action over the horizon.
+    """
+    batch = first_actions.shape[0]
+
+    if len(self.action_history) < CONTEXT_LENGTH:
+      return np.full((batch,), np.inf)
+    if len(self.state_history) < CONTEXT_LENGTH:
+      return np.full((batch,), np.inf)
+    if len(self.current_lataccel_history) < CONTEXT_LENGTH:
+      return np.full((batch,), np.inf)
+
+    # Controller histories have steps [0..T-1], but simulator uses [T-19..T]
+    # So we take 19 from history + current state/candidate action
+    past_actions = np.asarray(self.action_history[-(CONTEXT_LENGTH - 1):], dtype=np.float32)  # 19 actions
+    past_states = np.asarray([list(s) for s in self.state_history[-(CONTEXT_LENGTH - 1):]], dtype=np.float32)  # 19 states
+    past_preds = np.asarray(self.current_lataccel_history[-CONTEXT_LENGTH:], dtype=np.float32)  # 20 preds (this one matches)
+
+    current_state = np.asarray(list(state), dtype=np.float32)
+    state_ctx_full = np.concatenate([past_states, current_state[None, :]], axis=0)  # 20 states
+
+    state_ctx = np.tile(state_ctx_full[None, :, :], (batch, 1, 1))
+    # 19 past actions + placeholder for candidate = 20 actions
+    actions_ctx = np.tile(np.concatenate([past_actions, np.zeros((1,), dtype=np.float32)], axis=0)[None, :], (batch, 1))
+    preds_ctx = np.tile(past_preds[None, :], (batch, 1))
+    
+    if debug:
+      print(f"MPC context shapes: actions={actions_ctx.shape}, states={state_ctx.shape}, preds={preds_ctx.shape}")
+      print(f"MPC past_actions[-3:]: {past_actions[-3:]}")
+      print(f"MPC current_state: {current_state}")
+      print(f"MPC past_preds[-3:]: {past_preds[-3:]}")
+
+    u_prev = float(self.action_history[-1])
+    prev_lat = np.full((batch,), float(current_lataccel), dtype=np.float32)
+    total_cost = np.zeros((batch,), dtype=np.float32)
+
+    for k in range(horizon):
+      # 1D shooting: use the same first_action for all steps (constant action assumption)
+      actions_ctx[:, -1] = first_actions
+      model_states = np.concatenate([actions_ctx[:, :, None], state_ctx], axis=2)
+      pred = self.tpm.get_current_lataccel_deterministic_batch(model_states, preds_ctx)
+      pred = np.clip(pred, prev_lat - MAX_ACC_DELTA, prev_lat + MAX_ACC_DELTA)
+
+      if k == 0:
+        ref = float(target_lataccel)
+      else:
+        ref = float(future_plan.lataccel[k - 1])
+
+      lat_cost = ((ref - pred) ** 2) * 100.0
+      jerk_cost = (((pred - prev_lat) / DEL_T) ** 2) * 100.0
+      step_cost = (lat_cost * LAT_ACCEL_COST_MULTIPLIER) + jerk_cost
+
+      # Action delta cost only on first step (comparing to previous applied action)
+      if k == 0:
+        du = first_actions - u_prev
+        step_cost = step_cost + (MPC_ACTION_DELTA_COST * (du ** 2) * 100.0)
+
+      total_cost = total_cost + step_cost
+      prev_lat = pred.astype(np.float32)
+
+      if k < horizon - 1:
+        preds_ctx[:, :-1] = preds_ctx[:, 1:]
+        preds_ctx[:, -1] = prev_lat
+
+        actions_ctx[:, :-1] = actions_ctx[:, 1:]
+
+        if k == 0:
+          next_state = np.array([
+            future_plan.roll_lataccel[0],
+            future_plan.v_ego[0],
+            future_plan.a_ego[0],
+          ], dtype=np.float32)
+        else:
+          next_state = np.array([
+            future_plan.roll_lataccel[k],
+            future_plan.v_ego[k],
+            future_plan.a_ego[k],
+          ], dtype=np.float32)
+
+        state_ctx[:, :-1, :] = state_ctx[:, 1:, :]
+        state_ctx[:, -1, :] = next_state[None, :]
+
+    return total_cost
+
+
   def calc_mpc(self, target_lataccel, current_lataccel, state, future_plan, pid_result):
-    print("\n\n\n=====---====")
-    best_action = pid_result
-    best_cost = 0
-    best_lataccel, best_cost = self.predict_and_calc_cost(
-      target_lataccel=target_lataccel,
-      current_lataccel=current_lataccel,
-      state = state,
-      action=best_action,
-    )
+    """
+    1D Shooting MPC: grid search over first action, assume constant action over horizon.
+    """
+    horizon = self._get_horizon(future_plan)
+    
+    # Generate candidate first actions: grid around PID result
+    candidates = np.linspace(
+      max(STEER_RANGE[0], pid_result - MPC_ACTION_RANGE),
+      min(STEER_RANGE[1], pid_result + MPC_ACTION_RANGE),
+      MPC_NUM_CANDIDATES
+    ).astype(np.float32)
 
-    for candidate_action in np.linspace(pid_result - MPC_RANGE, pid_result + MPC_RANGE, MPC_BINS):
-      # Run sim & calc cost
-      candidate_lataccel, candidate_cost = self.predict_and_calc_cost(
-        target_lataccel=target_lataccel,
-        current_lataccel=current_lataccel,
-        state = state,
-        action=candidate_action,
-      )
-      print(f"Canddiate action|cost: {candidate_action} . {pid_result} | {candidate_cost} . {best_cost}")
-
-      # update candidate
-      if candidate_cost < best_cost:
-        best_cost = candidate_cost
-        best_action = candidate_action
-        best_lataccel = candidate_lataccel
-
-    return best_action, best_lataccel
+    costs = self._rollout_cost_1d(candidates, target_lataccel, current_lataccel, state, future_plan, horizon)
+    best_idx = np.argmin(costs)
+    best_action = float(candidates[best_idx])
+    
+    if MPC_DEBUG:
+      pid_idx = np.argmin(np.abs(candidates - pid_result))
+      min_cost_idx = np.argmin(costs)
+      max_cost_idx = np.argmax(costs)
+      print(f"err={target_lataccel-current_lataccel:+.2f} | PID={pid_result:+.3f}(cost={costs[pid_idx]:.0f}) | MPC={best_action:+.3f}(cost={costs[best_idx]:.0f}) | range=[{candidates[0]:+.2f},{candidates[-1]:+.2f}] | costs=[{costs[min_cost_idx]:.0f},{costs[max_cost_idx]:.0f}]")
+      # Print which action has min cost vs PID
+      if abs(best_action - pid_result) > 0.05:
+        print(f"  -> MPC differs from PID by {best_action-pid_result:+.3f}. Best action {best_action:.3f}, PID action {pid_result:.3f}")
+        # Debug: show what model predicts for a few actions
+        test_actions = np.array([candidates[0], pid_result, best_action, candidates[-1]], dtype=np.float32)
+        test_preds = self._predict_single_step(test_actions, current_lataccel, state)
+        print(f"  -> Model predicts: action={candidates[0]:.2f}->lat={test_preds[0]:.3f}, action={pid_result:.2f}->lat={test_preds[1]:.3f}, action={best_action:.2f}->lat={test_preds[2]:.3f}, action={candidates[-1]:.2f}->lat={test_preds[3]:.3f}")
+    
+    return best_action
 
 
   def update(self, target_lataccel, current_lataccel, state, future_plan):
@@ -135,16 +237,18 @@ class Controller(BaseController):
       future_plan=future_plan
     )
 
-    # do not run MPC until full context is bult
-    lataccel = current_lataccel
-    if len(self.action_history) >= CONTEXT_LENGTH:
-      action, lataccel = self.calc_mpc(
-        target_lataccel=target_lataccel, 
-        current_lataccel=current_lataccel,
-        state=state,
-        future_plan=future_plan,
-        pid_result=action,
-      )
+    step_idx = self._estimate_step_idx()
+    if step_idx >= CONTROL_START_IDX and future_plan is not None:
+      if len(self.action_history) >= CONTEXT_LENGTH and len(self.current_lataccel_history) >= CONTEXT_LENGTH and len(self.state_history) >= CONTEXT_LENGTH:
+        action = self.calc_mpc(
+          target_lataccel=target_lataccel,
+          current_lataccel=current_lataccel,
+          state=state,
+          future_plan=future_plan,
+          pid_result=action,
+        )
+
+    action = float(np.clip(action, STEER_RANGE[0], STEER_RANGE[1]))
 
     return action
 
